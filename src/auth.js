@@ -26,7 +26,10 @@ function initFirebase() {
     }
   }
 
-  if (serviceAccount?.private_key) {
+  if (serviceAccount) {
+    if (!serviceAccount.private_key) {
+      throw new Error("Firebase service account is missing private_key.");
+    }
     serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, "\n");
     admin.initializeApp({
       credential: admin.credential.cert(serviceAccount),

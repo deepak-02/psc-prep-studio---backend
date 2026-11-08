@@ -265,8 +265,8 @@ async function migrate() {
     for (const uDoc of usersSnap.docs) {
       const uid = uDoc.id;
       const [prefSnap, keySnap] = await Promise.all([
-        firestore.doc(`users/${uid}/settings/preferences`).get().catch(() => null),
-        firestore.doc(`users/${uid}/private/geminiKey`).get().catch(() => null),
+        firestore.doc(`users/${uid}/settings/preferences`).get(),
+        firestore.doc(`users/${uid}/private/geminiKey`).get(),
       ]);
 
       const userUpdate = {
