@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { getDb } from "../db.js";
 import { requireAuth, requireAdmin } from "../auth.js";
+import { asyncHandler } from "../asyncHandler.js";
 import {
   DEFAULT_BILLING_CONFIG,
   normaliseConfig,
@@ -28,9 +29,10 @@ async function logAudit(db, adminEmail, action, target, detail = null) {
 }
 
 // Overview stats
-router.get("/overview", async (req, res) => {
-  const db = await getDb();
-  try {
+router.get(
+  "/overview",
+  asyncHandler(async (req, res) => {
+    const db = await getDb();
     const [totalUsers, activePro, paymentsCount, ticketsOpen] = await Promise.all([
       db.collection("users").countDocuments(),
       db.collection("entitlements").countDocuments({ planId: { $ne: "free" }, subscriptionExpiresAt: { $gt: Date.now() } }),
@@ -43,29 +45,27 @@ router.get("/overview", async (req, res) => {
       payments: { paidCount: paymentsCount },
       support: { openCount: ticketsOpen },
     });
-  } catch (err) {
-    console.error("[admin/overview]", err);
-    res.status(500).json({ error: "Failed to load overview." });
-  }
-});
+  })
+);
 
 // List users with entitlements
-router.get("/users", async (req, res) => {
-  const db = await getDb();
-  const page = Math.max(1, Number(req.query.page) || 1);
-  const pageSize = Math.max(5, Math.min(100, Number(req.query.pageSize) || 20));
-  const query = (req.query.q ?? "").trim().toLowerCase();
+router.get(
+  "/users",
+  asyncHandler(async (req, res) => {
+    const db = await getDb();
+    const page = Math.max(1, Number(req.query.page) || 1);
+    const pageSize = Math.max(5, Math.min(100, Number(req.query.pageSize) || 20));
+    const query = (req.query.q ?? "").trim().toLowerCase();
 
-  const filter = {};
-  if (query) {
-    filter.$or = [
-      { email: { $regex: query, $options: "i" } },
-      { name: { $regex: query, $options: "i" } },
-      { _id: query },
-    ];
-  }
+    const filter = {};
+    if (query) {
+      filter.$or = [
+        { email: { $regex: query, $options: "i" } },
+        { name: { $regex: query, $options: "i" } },
+        { _id: query },
+      ];
+    }
 
-  try {
     const configDoc = await db.collection("billingConfig").findOne({ _id: "current" });
     const config = configDoc ? normaliseConfig(configDoc) : DEFAULT_BILLING_CONFIG;
 
@@ -99,19 +99,17 @@ router.get("/users", async (req, res) => {
       total,
       pages: Math.ceil(total / pageSize) || 1,
     });
-  } catch (err) {
-    console.error("[admin/users]", err);
-    res.status(500).json({ error: "Failed to load users." });
-  }
-});
+  })
+);
 
 // Update user entitlement
-router.post("/users/:uid", async (req, res) => {
-  const db = await getDb();
-  const { uid } = req.params;
-  const { action, product, days, count, credit, enabled, disabled } = req.body;
+router.post(
+  "/users/:uid",
+  asyncHandler(async (req, res) => {
+    const db = await getDb();
+    const { uid } = req.params;
+    const { action, product, days, count, credit, enabled, disabled } = req.body || {};
 
-  try {
     const raw = await db.collection("entitlements").findOne({ _id: uid });
     let e = raw ? normaliseEntitlement(uid, raw) : emptyEntitlement(uid);
     const configDoc = await db.collection("billingConfig").findOne({ _id: "current" });
@@ -157,19 +155,17 @@ router.post("/users/:uid", async (req, res) => {
       pro: isPro(e),
       quotas: remainingQuotas(config, e),
     });
-  } catch (err) {
-    console.error("[admin/user-update]", err);
-    res.status(500).json({ error: "Failed to update user." });
-  }
-});
+  })
+);
 
 // Admin payments list
-router.get("/payments", async (req, res) => {
-  const db = await getDb();
-  const page = Math.max(1, Number(req.query.page) || 1);
-  const pageSize = Math.max(5, Math.min(100, Number(req.query.pageSize) || 25));
+router.get(
+  "/payments",
+  asyncHandler(async (req, res) => {
+    const db = await getDb();
+    const page = Math.max(1, Number(req.query.page) || 1);
+    const pageSize = Math.max(5, Math.min(100, Number(req.query.pageSize) || 25));
 
-  try {
     const [payments, total] = await Promise.all([
       db.collection("payments").find({}).sort({ createdAt: -1 }).skip((page - 1) * pageSize).limit(pageSize).toArray(),
       db.collection("payments").countDocuments({}),
@@ -183,39 +179,43 @@ router.get("/payments", async (req, res) => {
       total,
       pages: Math.ceil(total / pageSize) || 1,
     });
-  } catch (err) {
-    console.error("[admin/payments]", err);
-    res.status(500).json({ error: "Failed to load payments." });
-  }
-});
+  })
+);
 
 // Get & Update billing config
-router.get("/billing-config", async (req, res) => {
-  const db = await getDb();
-  const doc = await db.collection("billingConfig").findOne({ _id: "current" });
-  res.json({ config: doc ? normaliseConfig(doc) : DEFAULT_BILLING_CONFIG });
-});
+router.get(
+  "/billing-config",
+  asyncHandler(async (req, res) => {
+    const db = await getDb();
+    const doc = await db.collection("billingConfig").findOne({ _id: "current" });
+    res.json({ config: doc ? normaliseConfig(doc) : DEFAULT_BILLING_CONFIG });
+  })
+);
 
-router.put("/billing-config", async (req, res) => {
-  const db = await getDb();
-  const nextConfig = normaliseConfig(req.body.config);
-  nextConfig.version = (nextConfig.version || 1) + 1;
-  nextConfig.updatedAt = Date.now();
-  nextConfig.updatedBy = req.user.email;
+router.put(
+  "/billing-config",
+  asyncHandler(async (req, res) => {
+    const db = await getDb();
+    const nextConfig = normaliseConfig(req.body.config);
+    nextConfig.version = (nextConfig.version || 1) + 1;
+    nextConfig.updatedAt = Date.now();
+    nextConfig.updatedBy = req.user.email;
 
-  await db.collection("billingConfig").updateOne({ _id: "current" }, { $set: nextConfig }, { upsert: true });
-  await logAudit(db, req.user.email, "billing_config_update", "billingConfig", nextConfig);
+    await db.collection("billingConfig").updateOne({ _id: "current" }, { $set: nextConfig }, { upsert: true });
+    await logAudit(db, req.user.email, "billing_config_update", "billingConfig", nextConfig);
 
-  res.json({ config: nextConfig });
-});
+    res.json({ config: nextConfig });
+  })
+);
 
 // Audit logs
-router.get("/audit", async (req, res) => {
-  const db = await getDb();
-  const page = Math.max(1, Number(req.query.page) || 1);
-  const pageSize = Math.max(5, Math.min(100, Number(req.query.pageSize) || 25));
+router.get(
+  "/audit",
+  asyncHandler(async (req, res) => {
+    const db = await getDb();
+    const page = Math.max(1, Number(req.query.page) || 1);
+    const pageSize = Math.max(5, Math.min(100, Number(req.query.pageSize) || 25));
 
-  try {
     const [logs, total] = await Promise.all([
       db.collection("adminAuditLogs").find({}).sort({ at: -1 }).skip((page - 1) * pageSize).limit(pageSize).toArray(),
       db.collection("adminAuditLogs").countDocuments({}),
@@ -229,18 +229,16 @@ router.get("/audit", async (req, res) => {
       pages: Math.ceil(total / pageSize) || 1,
       actions: [],
     });
-  } catch (err) {
-    console.error("[admin/audit]", err);
-    res.status(500).json({ error: "Failed to load audit logs." });
-  }
-});
+  })
+);
 
 // Support items
-router.get("/support", async (req, res) => {
-  const db = await getDb();
-  const kind = req.query.kind === "feedback" ? "feedback" : "ticket";
+router.get(
+  "/support",
+  asyncHandler(async (req, res) => {
+    const db = await getDb();
+    const kind = req.query.kind === "feedback" ? "feedback" : "ticket";
 
-  try {
     const items = await db.collection("support").find({ kind }).sort({ createdAt: -1 }).limit(100).toArray();
     res.json({
       items: items.map(({ _id, ...rest }) => ({ id: _id, ...rest })),
@@ -249,10 +247,7 @@ router.get("/support", async (req, res) => {
       page: 1,
       pageSize: 100,
     });
-  } catch (err) {
-    console.error("[admin/support]", err);
-    res.status(500).json({ error: "Failed to load support items." });
-  }
-});
+  })
+);
 
 export default router;

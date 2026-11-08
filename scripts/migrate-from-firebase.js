@@ -48,7 +48,8 @@ async function migrate() {
   await mongoClient.connect();
   const mdb = mongoClient.db();
 
-  console.log(`Connected to MongoDB at ${mongoUri}`);
+  console.log(`Connected to MongoDB at ${mongoUri.replace(/\/\/[^@/]+@/, "//***@")}`);
+  const failedSteps = [];
 
   // Helper to convert Firestore Timestamps to Date or numbers
   const sanitize = (val) => {
@@ -88,6 +89,7 @@ async function migrate() {
     console.log(`  -> sharedQuestions: ${count} documents migrated.`);
   } catch (e) {
     console.warn("  -> Error reading sharedQuestions:", e.message);
+    failedSteps.push("sharedQuestions");
   }
 
   // 2. Migrate Shared PYQs
@@ -99,6 +101,7 @@ async function migrate() {
     console.log(`  -> sharedPyq: ${count} documents migrated.`);
   } catch (e) {
     console.warn("  -> Error reading sharedPyq:", e.message);
+    failedSteps.push("sharedPyq");
   }
 
   // 3. Migrate Billing Config & History
@@ -110,6 +113,7 @@ async function migrate() {
     console.log(`  -> billingConfig: ${count} documents migrated.`);
   } catch (e) {
     console.warn("  -> Error reading billingConfig:", e.message);
+    failedSteps.push("billingConfig");
   }
 
   // 4. Migrate Entitlements
@@ -121,6 +125,7 @@ async function migrate() {
     console.log(`  -> entitlements: ${count} documents migrated.`);
   } catch (e) {
     console.warn("  -> Error reading entitlements:", e.message);
+    failedSteps.push("entitlements");
   }
 
   // 5. Migrate Payments
@@ -132,6 +137,7 @@ async function migrate() {
     console.log(`  -> payments: ${count} documents migrated.`);
   } catch (e) {
     console.warn("  -> Error reading payments:", e.message);
+    failedSteps.push("payments");
   }
 
   // 6. Migrate Support Tickets & Feedback
@@ -150,6 +156,7 @@ async function migrate() {
     console.log(`  -> support items: ${count} documents migrated.`);
   } catch (e) {
     console.warn("  -> Error reading support:", e.message);
+    failedSteps.push("support");
   }
 
   // 7. Migrate Admin Audit Logs
@@ -161,6 +168,7 @@ async function migrate() {
     console.log(`  -> adminAuditLogs: ${count} documents migrated.`);
   } catch (e) {
     console.warn("  -> Error reading adminAuditLogs:", e.message);
+    failedSteps.push("adminAuditLogs");
   }
 
   // 8. Migrate User subcollections: questions, attempts, resources, preferences, geminiKey
@@ -178,21 +186,33 @@ async function migrate() {
       return parts[1] || null;
     };
 
-    const qDocs = qSnap.docs.map((d) => ({
-      _id: d.id,
-      ownerId: d.data().ownerId || parseOwner(d.ref),
-      ...sanitize(d.data()),
-    }));
-    const aDocs = aSnap.docs.map((d) => ({
-      _id: d.id,
-      ownerId: d.data().ownerId || parseOwner(d.ref),
-      ...sanitize(d.data()),
-    }));
-    const rDocs = rSnap.docs.map((d) => ({
-      _id: d.id,
-      ownerId: d.data().ownerId || parseOwner(d.ref),
-      ...sanitize(d.data()),
-    }));
+    const qDocs = qSnap.docs.map((d) => {
+      const ownerId = d.data().ownerId || parseOwner(d.ref);
+      return {
+        _id: `${ownerId}:${d.id}`,
+        id: d.id,
+        ownerId,
+        ...sanitize(d.data()),
+      };
+    });
+    const aDocs = aSnap.docs.map((d) => {
+      const ownerId = d.data().ownerId || parseOwner(d.ref);
+      return {
+        _id: `${ownerId}:${d.id}`,
+        id: d.id,
+        ownerId,
+        ...sanitize(d.data()),
+      };
+    });
+    const rDocs = rSnap.docs.map((d) => {
+      const ownerId = d.data().ownerId || parseOwner(d.ref);
+      return {
+        _id: `${ownerId}:${d.id}`,
+        id: d.id,
+        ownerId,
+        ...sanitize(d.data()),
+      };
+    });
 
     const [qCount, aCount, rCount] = await Promise.all([
       upsertBatch("questions", qDocs),
@@ -205,14 +225,13 @@ async function migrate() {
     console.log(`  -> user resources: ${rCount} documents migrated.`);
   } catch (e) {
     console.warn("  -> Error reading user collection groups:", e.message);
+    failedSteps.push("userCollectionGroups");
   }
 
   // 9. Migrate user purchases and user tests
   console.log("Migrating userPurchases & userTests...");
   try {
-    const [pSnap, tSnap] = await Promise.all([
-      firestore.collectionGroup("items").get().catch(() => ({ docs: [] })),
-    ]);
+    const pSnap = await firestore.collectionGroup("items").get();
 
     const purchases = [];
     const tests = [];
@@ -236,6 +255,7 @@ async function migrate() {
     console.log(`  -> purchases: ${pCount}, tests: ${tCount} migrated.`);
   } catch (e) {
     console.warn("  -> Error reading items collection group:", e.message);
+    failedSteps.push("userPurchases/userTests");
   }
 
   // 10. Migrate user profiles & settings
@@ -245,8 +265,8 @@ async function migrate() {
     for (const uDoc of usersSnap.docs) {
       const uid = uDoc.id;
       const [prefSnap, keySnap] = await Promise.all([
-        firestore.doc(`users/${uid}/settings/preferences`).get().catch(() => null),
-        firestore.doc(`users/${uid}/private/geminiKey`).get().catch(() => null),
+        firestore.doc(`users/${uid}/settings/preferences`).get(),
+        firestore.doc(`users/${uid}/private/geminiKey`).get(),
       ]);
 
       const userUpdate = {
@@ -265,9 +285,15 @@ async function migrate() {
     console.log(`  -> users settings migrated for ${usersSnap.docs.length} users.`);
   } catch (e) {
     console.warn("  -> Error reading user settings:", e.message);
+    failedSteps.push("usersSettings");
   }
 
-  console.log("\nMigration completed successfully!");
+  if (failedSteps.length > 0) {
+    console.error(`\nMigration completed with failures in: ${failedSteps.join(", ")}`);
+    process.exitCode = 1;
+  } else {
+    console.log("\nMigration completed successfully!");
+  }
   await mongoClient.close();
 }
 

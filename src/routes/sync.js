@@ -1,39 +1,43 @@
 import { Router } from "express";
 import { getDb } from "../db.js";
 import { requireAuth } from "../auth.js";
+import { asyncHandler } from "../asyncHandler.js";
 
 const router = Router();
 
 // Bulk sync push (saves questions, attempts, resources in a batch)
-router.post("/push", requireAuth, async (req, res) => {
-  const db = await getDb();
-  const uid = req.user.uid;
-  const { questions, attempts, resources } = req.body;
+router.post(
+  "/push",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const db = await getDb();
+    const uid = req.user.uid;
+    const { questions, attempts, resources } = req.body || {};
 
-  let committed = 0;
+    let committed = 0;
 
-  const saveBatch = async (colName, items) => {
-    if (!Array.isArray(items) || !items.length) return;
-    const ops = items
-      .filter((item) => item && typeof item.id === "string")
-      .map((item) => {
-        const { id, ...rest } = item;
-        return {
-          updateOne: {
-            filter: { _id: id, ownerId: uid },
-            update: { $set: { ...rest, _id: id, ownerId: uid } },
-            upsert: true,
-          },
-        };
-      });
+    const saveBatch = async (colName, items) => {
+      if (!Array.isArray(items) || !items.length) return;
+      const ops = items
+        .filter((item) => item && typeof item.id === "string")
+        .map((item) => {
+          const { id, ...rest } = item;
+          const storageId = `${uid}:${id}`;
+          return {
+            updateOne: {
+              filter: { _id: storageId },
+              update: { $set: { ...rest, id, ownerId: uid, _id: storageId } },
+              upsert: true,
+            },
+          };
+        });
 
-    if (ops.length) {
-      const result = await db.collection(colName).bulkWrite(ops);
-      committed += (result.upsertedCount || 0) + (result.modifiedCount || 0);
-    }
-  };
+      if (ops.length) {
+        const result = await db.collection(colName).bulkWrite(ops);
+        committed += (result.upsertedCount || 0) + (result.modifiedCount || 0);
+      }
+    };
 
-  try {
     await Promise.all([
       saveBatch("questions", questions),
       saveBatch("attempts", attempts),
@@ -41,18 +45,17 @@ router.post("/push", requireAuth, async (req, res) => {
     ]);
 
     res.json({ ok: true, committed });
-  } catch (err) {
-    console.error("[sync/push]", err);
-    res.status(500).json({ error: "Failed to save records." });
-  }
-});
+  })
+);
 
 // Full sync pull for workspace loading
-router.get("/pull", requireAuth, async (req, res) => {
-  const db = await getDb();
-  const uid = req.user.uid;
+router.get(
+  "/pull",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const db = await getDb();
+    const uid = req.user.uid;
 
-  try {
     const [questions, attempts, resources] = await Promise.all([
       db.collection("questions").find({ ownerId: uid }).toArray(),
       db.collection("attempts").find({ ownerId: uid }).sort({ createdAt: -1 }).toArray(),
@@ -60,7 +63,10 @@ router.get("/pull", requireAuth, async (req, res) => {
     ]);
 
     const normalize = (rows) =>
-      rows.map(({ _id, ...rest }) => ({ id: _id, ...rest }));
+      rows.map(({ _id, id, ...rest }) => ({
+        id: id || String(_id).replace(/^[^:]+:/, ""),
+        ...rest,
+      }));
 
     res.json({
       questions: normalize(questions),
@@ -68,28 +74,33 @@ router.get("/pull", requireAuth, async (req, res) => {
       resources: normalize(resources),
       issues: [],
     });
-  } catch (err) {
-    console.error("[sync/pull]", err);
-    res.status(500).json({ error: "Failed to load records." });
-  }
-});
+  })
+);
 
 // Paginated attempts page
-router.get("/attempts", requireAuth, async (req, res) => {
-  const db = await getDb();
-  const uid = req.user.uid;
-  const limit = Math.max(1, Math.min(100, Number(req.query.limit) || 25));
-  const { afterCreatedAt, afterId } = req.query;
+router.get(
+  "/attempts",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const db = await getDb();
+    const uid = req.user.uid;
+    const limit = Math.max(1, Math.min(100, Number(req.query.limit) || 25));
+    const { afterCreatedAt, afterId } = req.query;
 
-  const filter = { ownerId: uid };
-  if (afterCreatedAt && afterId) {
-    filter.$or = [
-      { createdAt: { $lt: String(afterCreatedAt) } },
-      { createdAt: String(afterCreatedAt), _id: { $lt: String(afterId) } },
-    ];
-  }
+    const filter = { ownerId: uid };
+    if (afterCreatedAt !== undefined && afterId !== undefined) {
+      const ts =
+        typeof afterCreatedAt === "string" && !isNaN(Number(afterCreatedAt))
+          ? Number(afterCreatedAt)
+          : afterCreatedAt;
 
-  try {
+      const targetId = `${uid}:${afterId}`;
+      filter.$or = [
+        { createdAt: { $lt: ts } },
+        { createdAt: ts, _id: { $lt: targetId } },
+      ];
+    }
+
     const docs = await db
       .collection("attempts")
       .find(filter)
@@ -97,7 +108,10 @@ router.get("/attempts", requireAuth, async (req, res) => {
       .limit(limit)
       .toArray();
 
-    const rows = docs.map(({ _id, ...rest }) => ({ id: _id, ...rest }));
+    const rows = docs.map(({ _id, id, ...rest }) => ({
+      id: id || String(_id).replace(/^[^:]+:/, ""),
+      ...rest,
+    }));
     const last = rows.at(-1);
 
     const next =
@@ -106,10 +120,7 @@ router.get("/attempts", requireAuth, async (req, res) => {
         : undefined;
 
     res.json({ rows, next });
-  } catch (err) {
-    console.error("[attempts]", err);
-    res.status(500).json({ error: "Failed to load attempts page." });
-  }
-});
+  })
+);
 
 export default router;
