@@ -13,14 +13,16 @@ function initFirebase() {
   if (raw) {
     try {
       serviceAccount = JSON.parse(raw);
-    } catch {
-      // Ignore parse failure
+    } catch (e) {
+      console.warn("Failed to parse FIREBASE_SERVICE_ACCOUNT JSON:", e.message);
+      throw new Error("Invalid FIREBASE_SERVICE_ACCOUNT configuration.");
     }
   } else if (b64) {
     try {
       serviceAccount = JSON.parse(Buffer.from(b64, "base64").toString("utf8"));
-    } catch {
-      // Ignore parse failure
+    } catch (e) {
+      console.warn("Failed to parse FIREBASE_SERVICE_ACCOUNT_BASE64:", e.message);
+      throw new Error("Invalid FIREBASE_SERVICE_ACCOUNT_BASE64 configuration.");
     }
   }
 
@@ -64,8 +66,8 @@ export async function requireAuth(req, res, next) {
 }
 
 export function requireAdmin(req, res, next) {
-  const adminEmail = process.env.ADMIN_EMAIL || "deepakck.ptf@gmail.com";
-  if (!req.user || req.user.email !== adminEmail || !req.user.emailVerified) {
+  const adminEmail = process.env.ADMIN_EMAIL;
+  if (!adminEmail || !req.user || req.user.email !== adminEmail || !req.user.emailVerified) {
     return res.status(403).json({ error: "Admin only." });
   }
   next();

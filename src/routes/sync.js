@@ -22,10 +22,11 @@ router.post(
         .filter((item) => item && typeof item.id === "string")
         .map((item) => {
           const { id, ...rest } = item;
+          const storageId = `${uid}:${id}`;
           return {
             updateOne: {
-              filter: { _id: id, ownerId: uid },
-              update: { $set: { ...rest, _id: id, ownerId: uid } },
+              filter: { _id: storageId },
+              update: { $set: { ...rest, id, ownerId: uid, _id: storageId } },
               upsert: true,
             },
           };
@@ -62,7 +63,10 @@ router.get(
     ]);
 
     const normalize = (rows) =>
-      rows.map(({ _id, ...rest }) => ({ id: _id, ...rest }));
+      rows.map(({ _id, id, ...rest }) => ({
+        id: id || String(_id).replace(/^[^:]+:/, ""),
+        ...rest,
+      }));
 
     res.json({
       questions: normalize(questions),
@@ -90,9 +94,10 @@ router.get(
           ? Number(afterCreatedAt)
           : afterCreatedAt;
 
+      const targetId = `${uid}:${afterId}`;
       filter.$or = [
         { createdAt: { $lt: ts } },
-        { createdAt: ts, _id: { $lt: String(afterId) } },
+        { createdAt: ts, _id: { $lt: targetId } },
       ];
     }
 
@@ -103,7 +108,10 @@ router.get(
       .limit(limit)
       .toArray();
 
-    const rows = docs.map(({ _id, ...rest }) => ({ id: _id, ...rest }));
+    const rows = docs.map(({ _id, id, ...rest }) => ({
+      id: id || String(_id).replace(/^[^:]+:/, ""),
+      ...rest,
+    }));
     const last = rows.at(-1);
 
     const next =

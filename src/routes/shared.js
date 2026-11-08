@@ -133,6 +133,10 @@ router.post(
       return null;
     }).filter(Boolean);
 
+    if (!cleanRows.length) {
+      return res.status(400).json({ error: "Questions list required." });
+    }
+
     const doc = {
       _id: paperId,
       v: 1,

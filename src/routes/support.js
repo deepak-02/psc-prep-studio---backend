@@ -50,7 +50,7 @@ router.post(
     }
 
     const id = `tkt_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
-    const reference = id.slice(-6).toUpperCase();
+    const reference = id.split("_").pop().toUpperCase();
 
     const doc = {
       _id: id,
