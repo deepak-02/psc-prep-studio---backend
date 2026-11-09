@@ -627,12 +627,64 @@ router.post(
   })
 );
 
+// Filtered, searchable, paginated email log
 router.get(
   "/email/log",
   asyncHandler(async (req, res) => {
     const db = await getDb();
-    const items = await db.collection("emailLog").find({}).sort({ at: -1 }).limit(50).toArray();
-    res.json({ items: items.map(({ _id, ...rest }) => ({ id: _id, ...rest })) });
+    const page = Math.max(1, Number(req.query.page) || 1);
+    const pageSize = Math.max(5, Math.min(100, Number(req.query.pageSize) || 20));
+    const template = req.query.template ? String(req.query.template).trim() : "";
+    const status = req.query.status ? String(req.query.status).trim() : "";
+    const q = req.query.q ? String(req.query.q).trim() : "";
+    const sort = req.query.sort === "oldest" ? 1 : -1;
+
+    const filter = {};
+    if (template) filter.template = template;
+    if (status === "sent") filter.ok = true;
+    if (status === "failed") filter.ok = false;
+    if (q) {
+      filter.$or = [
+        { to: { $regex: q, $options: "i" } },
+        { subject: { $regex: q, $options: "i" } },
+        { template: { $regex: q, $options: "i" } },
+        { ref: { $regex: q, $options: "i" } },
+        { error: { $regex: q, $options: "i" } },
+      ];
+    }
+
+    const [items, total, templatesList] = await Promise.all([
+      db
+        .collection("emailLog")
+        .find(filter)
+        .sort({ at: sort })
+        .skip((page - 1) * pageSize)
+        .limit(pageSize)
+        .toArray(),
+      db.collection("emailLog").countDocuments(filter),
+      db.collection("emailLog").distinct("template"),
+    ]);
+
+    res.json({
+      items: items.map(({ _id, ...rest }) => ({ id: _id, ...rest })),
+      total,
+      page,
+      pageSize,
+      pages: Math.ceil(total / pageSize) || 1,
+      templates: templatesList.filter(Boolean).sort(),
+    });
+  })
+);
+
+// Trigger sending weekly executive report to admin on demand
+router.post(
+  "/email/send-weekly",
+  asyncHandler(async (req, res) => {
+    const db = await getDb();
+    const { sendWeeklyDigest } = await import("../adminNotifier.js");
+    const result = await sendWeeklyDigest();
+    await logAudit(db, req.user.email, "send_weekly_report", "email", result);
+    res.json(result);
   })
 );
 

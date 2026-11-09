@@ -68,6 +68,9 @@ router.post(
     };
 
     await db.collection("support").insertOne(doc);
+    void import("../adminNotifier.js").then((m) =>
+      m.notifySupportTicket(doc).catch(() => undefined)
+    );
     res.json({ ok: true, reference, emailed: false });
   })
 );
@@ -111,6 +114,9 @@ router.post(
     };
 
     await db.collection("support").insertOne(doc);
+    void import("../adminNotifier.js").then((m) =>
+      m.notifyFeedback(doc).catch(() => undefined)
+    );
     res.json({ ok: true });
   })
 );

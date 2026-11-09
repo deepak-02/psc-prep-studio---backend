@@ -70,7 +70,7 @@ router.get(
     const entitlement = await loadEntitlement(db, uid, req.user.email);
 
     // Update user's lastSeen, profile & provider info on GET /me
-    await db.collection("users").updateOne(
+    const userUpdate = await db.collection("users").updateOne(
       { _id: uid },
       {
         $set: {
@@ -86,6 +86,17 @@ router.get(
       },
       { upsert: true }
     );
+
+    if (userUpdate.upsertedCount > 0) {
+      void import("../adminNotifier.js").then((m) =>
+        m.notifyNewUser({
+          uid,
+          email: req.user.email,
+          name: req.user.name,
+          provider: (req.user.providers || [])[0] || "email",
+        }).catch(() => undefined)
+      );
+    }
 
     const adminEmail = process.env.ADMIN_EMAIL || "deepakck.ptf@gmail.com";
     const isAdmin = req.user.email === adminEmail && req.user.emailVerified;
@@ -767,6 +778,18 @@ export async function settleOrder(db, order, paymentId, settledVia = "verify", e
     }
 
     await saveEntitlement(db, next, email);
+    void import("../adminNotifier.js").then((m) =>
+      m.notifyPurchase({
+        orderId: order.orderId,
+        paymentId,
+        amount: order.amount,
+        productLabel: order.productLabel,
+        product: order.product,
+        email: email || order.email,
+        name: order.name,
+        method: order.method || settledVia,
+      }).catch(() => undefined)
+    );
     return { settled: true, entitlement: next, quotas: remainingQuotas(config, next) };
   }
 
@@ -847,6 +870,21 @@ router.get(
     }
     const db = await getDb();
     const result = await reconcileOrders(db, {});
+    res.json(result);
+  })
+);
+
+// Weekly executive digest cron trigger
+router.get(
+  "/cron/weekly-report",
+  asyncHandler(async (req, res) => {
+    const secret = process.env.CRON_SECRET?.trim();
+    const auth = req.headers.authorization;
+    if (!secret || auth !== `Bearer ${secret}`) {
+      return res.status(401).json({ error: "Unauthorized." });
+    }
+    const { sendWeeklyDigest } = await import("../adminNotifier.js");
+    const result = await sendWeeklyDigest();
     res.json(result);
   })
 );

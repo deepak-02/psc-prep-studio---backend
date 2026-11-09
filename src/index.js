@@ -134,6 +134,13 @@ app.use((req, res) => {
 // Error handling middleware
 app.use((err, req, res, next) => {
   console.error("[error]", err);
+  void import("./adminNotifier.js").then((m) =>
+    m.notifyCriticalError({
+      error: err,
+      context: `${req.method} ${req.originalUrl || req.url}`,
+      req,
+    }).catch(() => undefined)
+  );
   res.status(500).json({ error: "Internal server error" });
 });
 
