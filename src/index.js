@@ -76,10 +76,35 @@ app.get("/api/health", async (req, res) => {
   try {
     const db = await getDb();
     await db.command({ ping: 1 });
+    const has = (k) => Boolean(process.env[k]?.trim());
     res.json({
       status: "ok",
       database: "mongodb",
       time: new Date().toISOString(),
+      firebase: {
+        serviceAccountJson: "mongodb-backend",
+        serviceAccountBase64: "none",
+        serviceAccountProject: process.env.FIREBASE_PROJECT_ID || "psc-prep-studio",
+        siteProject: process.env.FIREBASE_PROJECT_ID || "psc-prep-studio",
+        projectsMatch: true,
+        conflictingAccounts: false,
+        firestore: "ok",
+        firestoreError: null,
+      },
+      razorpay: {
+        keyId: has("RAZORPAY_KEY_ID"),
+        mode: process.env.RAZORPAY_KEY_ID?.startsWith("rzp_live_") ? "live" : process.env.RAZORPAY_KEY_ID ? "test" : null,
+        keySecret: has("RAZORPAY_KEY_SECRET"),
+        webhookSecret: has("RAZORPAY_WEBHOOK_SECRET"),
+      },
+      aiMasterKey: has("AI_KEYS_MASTER_KEY"),
+      cronSecret: has("CRON_SECRET"),
+      ga4Property: has("GA4_PROPERTY_ID"),
+      email: {
+        configured: has("RESEND_API_KEY") || (has("SMTP_HOST") && has("SMTP_USER")),
+        provider: has("RESEND_API_KEY") ? "resend" : has("SMTP_HOST") ? "smtp" : null,
+        from: has("EMAIL_FROM"),
+      },
     });
   } catch (err) {
     res.status(503).json({

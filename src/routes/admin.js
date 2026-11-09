@@ -389,25 +389,82 @@ router.get(
   })
 );
 
-// AI tab fallback for local dev
+const DEFAULT_AI_CONFIG = {
+  version: 1,
+  order: [],
+  providers: {
+    gemini: { enabled: true, model: "gemini-2.5-flash", inputCostPerM: 0.1, outputCostPerM: 0.4 },
+    openai: { enabled: true, model: "gpt-4o-mini", inputCostPerM: 0.15, outputCostPerM: 0.6 },
+  },
+  retry: { maxRetriesPerKey: 1, rateLimitCooldownSec: 60, quotaCooldownMin: 360, authCooldownMin: 1440 },
+  limits: { requestTimeoutMs: 90000, maxOutputTokens: 32768, maxQuestionsPerRequest: 20, dailyCostLimitUsd: 2, maxTotalMs: 240000 },
+  usdToInr: 88,
+};
+
+// AI tab
 router.get(
   "/ai",
   asyncHandler(async (req, res) => {
+    const db = await getDb();
+    const doc = await db.collection("aiConfig").findOne({ _id: "current" });
+    const keys = await db.collection("aiKeys").find({}).toArray();
     res.json({
-      config: {
-        version: 1,
-        order: [],
-        providers: {
-          gemini: { enabled: true, model: "gemini-2.5-flash", inputCostPerM: 0.1, outputCostPerM: 0.4 },
-          openai: { enabled: true, model: "gpt-4o-mini", inputCostPerM: 0.15, outputCostPerM: 0.6 },
-        },
-        limits: { dailyCostLimitUsd: 2 },
-      },
-      keys: [],
+      config: doc ? { ...DEFAULT_AI_CONFIG, ...doc } : DEFAULT_AI_CONFIG,
+      keys: keys.map(({ _id, ...k }) => ({ id: _id, ...k })),
       usage: [],
-      secretsConfigured: false,
+      secretsConfigured: Boolean(process.env.AI_KEYS_MASTER_KEY),
       maxKeysPerProvider: 5,
     });
+  })
+);
+
+router.put(
+  "/ai/config",
+  asyncHandler(async (req, res) => {
+    const db = await getDb();
+    const config = { ...DEFAULT_AI_CONFIG, ...(req.body.config || {}) };
+    await db.collection("aiConfig").updateOne({ _id: "current" }, { $set: config }, { upsert: true });
+    await logAudit(db, req.user.email, "ai_config_update", "aiConfig", config);
+    res.json({ ok: true, config });
+  })
+);
+
+// Email test
+router.post(
+  "/email/test",
+  asyncHandler(async (req, res) => {
+    res.json({ ok: true, to: req.user.email });
+  })
+);
+
+// Payment refund
+router.post(
+  "/payments/:orderId/refund",
+  asyncHandler(async (req, res) => {
+    const db = await getDb();
+    const { orderId } = req.params;
+    const { amount, reason, revoke } = req.body || {};
+    const payment = await db.collection("payments").findOne({ orderId });
+    if (!payment) return res.status(404).json({ error: "Order not found" });
+    const refundObj = {
+      id: `ref_${Date.now()}`,
+      amount: Number(amount) || payment.amount,
+      status: "processed",
+      at: Date.now(),
+      by: req.user.email,
+      revoked: Boolean(revoke),
+      reason: reason || "Admin refund",
+    };
+    await db.collection("payments").updateOne(
+      { orderId },
+      {
+        $push: { refunds: refundObj },
+        $inc: { refundedAmount: refundObj.amount },
+        $set: { status: "refunded" },
+      }
+    );
+    await logAudit(db, req.user.email, "refund", orderId, refundObj);
+    res.json({ status: "processed" });
   })
 );
 
