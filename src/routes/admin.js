@@ -305,6 +305,20 @@ router.post(
   })
 );
 
+router.get(
+  "/payments/:id",
+  asyncHandler(async (req, res) => {
+    const db = await getDb();
+    const { id } = req.params;
+    const doc = await db.collection("payments").findOne({
+      $or: [{ _id: id }, { orderId: id }, { internalOrderId: id }, { paymentId: id }],
+    });
+    if (!doc) return res.status(404).json({ error: "Payment not found." });
+    const { _id, ...rest } = doc;
+    res.json({ payment: { id: _id, ...rest } });
+  })
+);
+
 // Get & Update billing config
 router.get(
   "/billing-config",
@@ -389,6 +403,37 @@ router.get(
   })
 );
 
+router.post(
+  "/support/:kind/:id",
+  asyncHandler(async (req, res) => {
+    const db = await getDb();
+    const { id } = req.params;
+    const { status, note } = req.body || {};
+    const update = { status: status || "open" };
+    if (note !== undefined) update.adminNote = note;
+    await db.collection("support").updateOne({ _id: id }, { $set: update });
+    await logAudit(db, req.user.email, "support_update", id, update);
+    res.json({ ok: true });
+  })
+);
+
+router.post(
+  "/support/tickets/:id/reply",
+  asyncHandler(async (req, res) => {
+    const db = await getDb();
+    const { id } = req.params;
+    const message = String(req.body?.message || "").trim();
+    if (!message) return res.status(400).json({ error: "Message is required" });
+    const reply = { at: Date.now(), by: req.user.email, text: message };
+    await db.collection("support").updateOne(
+      { _id: id },
+      { $push: { replies: reply }, $set: { status: "in_progress" } }
+    );
+    await logAudit(db, req.user.email, "support_reply", id, { text: message.slice(0, 100) });
+    res.json({ ok: true });
+  })
+);
+
 const DEFAULT_AI_CONFIG = {
   version: 1,
   order: [],
@@ -406,13 +451,14 @@ router.get(
   "/ai",
   asyncHandler(async (req, res) => {
     const db = await getDb();
+    const { secretsConfigured } = await import("../aiSecrets.js");
     const doc = await db.collection("aiConfig").findOne({ _id: "current" });
     const keys = await db.collection("aiKeys").find({}).toArray();
     res.json({
       config: doc ? { ...DEFAULT_AI_CONFIG, ...doc } : DEFAULT_AI_CONFIG,
       keys: keys.map(({ _id, ...k }) => ({ id: _id, ...k })),
       usage: [],
-      secretsConfigured: Boolean(process.env.AI_KEYS_MASTER_KEY),
+      secretsConfigured: secretsConfigured(),
       maxKeysPerProvider: 5,
     });
   })
@@ -429,11 +475,164 @@ router.put(
   })
 );
 
+router.post(
+  "/ai/keys",
+  asyncHandler(async (req, res) => {
+    const db = await getDb();
+    const { secretsConfigured, seal, mask, testProviderKey } = await import("../aiSecrets.js");
+    const { provider, label, apiKey, test } = req.body || {};
+
+    if (provider !== "gemini" && provider !== "openai") {
+      return res.status(400).json({ error: "Unknown provider." });
+    }
+    const key = String(apiKey || "").trim();
+    if (key.length < 20 || key.length > 300 || /\s/.test(key)) {
+      return res.status(400).json({ error: "That does not look like a valid API key." });
+    }
+    if (!secretsConfigured()) {
+      return res.status(503).json({ error: "Set AI_KEYS_MASTER_KEY on the backend server before adding keys." });
+    }
+
+    const existingKeys = await db.collection("aiKeys").find({ provider }).toArray();
+    if (existingKeys.length >= 5) {
+      return res.status(409).json({ error: `Up to 5 ${provider} keys allowed.` });
+    }
+
+    if (test !== false) {
+      try {
+        await testProviderKey(provider, key);
+      } catch (err) {
+        return res.status(400).json({ error: `Key test failed: ${err.message}` });
+      }
+    }
+
+    const id = `${provider}_${Math.random().toString(36).slice(2, 14)}`;
+    const sealed = seal(key, id);
+    const meta = {
+      _id: id,
+      id,
+      provider,
+      label: String(label || "").trim().slice(0, 40) || `${provider} key`,
+      masked: mask(key),
+      enabled: true,
+      createdAt: Date.now(),
+      health: "healthy",
+      failureCount: 0,
+      consecutiveFailures: 0,
+      lastSuccessAt: Date.now(),
+      lastFailureAt: null,
+      lastError: null,
+      cooldownUntil: null,
+      usage: { requests: 0, inputTokens: 0, outputTokens: 0, costUsd: 0 },
+    };
+
+    await db.collection("aiSecrets").updateOne({ _id: id }, { $set: { _id: id, sealed, provider, updatedAt: Date.now() } }, { upsert: true });
+    await db.collection("aiKeys").updateOne({ _id: id }, { $set: meta }, { upsert: true });
+
+    const doc = await db.collection("aiConfig").findOne({ _id: "current" });
+    const order = doc?.order || [];
+    if (!order.includes(id)) {
+      await db.collection("aiConfig").updateOne({ _id: "current" }, { $set: { order: [...order, id] } }, { upsert: true });
+    }
+
+    await logAudit(db, req.user.email, "ai_key_add", id, { provider, label: meta.label, masked: meta.masked });
+    res.json({ ok: true, key: meta, ...meta });
+  })
+);
+
+router.post(
+  "/ai/keys/:id",
+  asyncHandler(async (req, res) => {
+    const db = await getDb();
+    const { seal, mask, secretsConfigured } = await import("../aiSecrets.js");
+    const { id } = req.params;
+    const { label, enabled, apiKey } = req.body || {};
+
+    const existing = await db.collection("aiKeys").findOne({ _id: id });
+    if (!existing) return res.status(404).json({ error: "Key not found." });
+
+    const change = {};
+    if (typeof label === "string") change.label = label.trim().slice(0, 40) || existing.label;
+    if (typeof enabled === "boolean") {
+      change.enabled = enabled;
+      if (enabled) {
+        change.cooldownUntil = null;
+        change.consecutiveFailures = 0;
+      }
+    }
+    if (typeof apiKey === "string" && apiKey.trim()) {
+      const key = apiKey.trim();
+      if (key.length < 20 || /\s/.test(key)) return res.status(400).json({ error: "Invalid API key format." });
+      if (!secretsConfigured()) return res.status(503).json({ error: "AI_KEYS_MASTER_KEY is not configured." });
+      const sealed = seal(key, id);
+      await db.collection("aiSecrets").updateOne({ _id: id }, { $set: { sealed, updatedAt: Date.now() } });
+      change.masked = mask(key);
+      change.health = "healthy";
+      change.consecutiveFailures = 0;
+      change.cooldownUntil = null;
+      change.lastError = null;
+    }
+
+    await db.collection("aiKeys").updateOne({ _id: id }, { $set: change });
+    await logAudit(db, req.user.email, apiKey ? "ai_key_replace" : "ai_key_update", id, change);
+    res.json({ key: { ...existing, ...change } });
+  })
+);
+
+router.post(
+  "/ai/keys/:id/test",
+  asyncHandler(async (req, res) => {
+    const db = await getDb();
+    const { open, testProviderKey } = await import("../aiSecrets.js");
+    const { id } = req.params;
+
+    const sec = await db.collection("aiSecrets").findOne({ _id: id });
+    if (!sec) return res.status(404).json({ error: "Key secret not found." });
+
+    try {
+      const rawKey = open(sec.sealed, id);
+      await testProviderKey(sec.provider, rawKey);
+      await db.collection("aiKeys").updateOne({ _id: id }, { $set: { health: "healthy", lastSuccessAt: Date.now(), lastError: null } });
+      await logAudit(db, req.user.email, "ai_key_test", id, { ok: true });
+      res.json({ ok: true });
+    } catch (e) {
+      await db.collection("aiKeys").updateOne({ _id: id }, { $set: { health: "failing", lastFailureAt: Date.now(), lastError: e.message } });
+      await logAudit(db, req.user.email, "ai_key_test", id, { ok: false, error: e.message });
+      res.json({ ok: false, kind: e.message });
+    }
+  })
+);
+
+router.post(
+  "/ai/keys/:id/delete",
+  asyncHandler(async (req, res) => {
+    const db = await getDb();
+    const { id } = req.params;
+    await db.collection("aiSecrets").deleteOne({ _id: id });
+    await db.collection("aiKeys").deleteOne({ _id: id });
+    const doc = await db.collection("aiConfig").findOne({ _id: "current" });
+    if (doc?.order) {
+      await db.collection("aiConfig").updateOne({ _id: "current" }, { $set: { order: doc.order.filter((x) => x !== id) } });
+    }
+    await logAudit(db, req.user.email, "ai_key_remove", id);
+    res.json({ ok: true });
+  })
+);
+
 // Email test
 router.post(
   "/email/test",
   asyncHandler(async (req, res) => {
     res.json({ ok: true, to: req.user.email });
+  })
+);
+
+router.get(
+  "/email/log",
+  asyncHandler(async (req, res) => {
+    const db = await getDb();
+    const items = await db.collection("emailLog").find({}).sort({ at: -1 }).limit(50).toArray();
+    res.json({ items: items.map(({ _id, ...rest }) => ({ id: _id, ...rest })) });
   })
 );
 

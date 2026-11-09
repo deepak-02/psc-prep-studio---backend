@@ -3,6 +3,8 @@ import crypto from "node:crypto";
 import { getDb } from "../db.js";
 import { requireAuth } from "../auth.js";
 import { asyncHandler } from "../asyncHandler.js";
+import { open } from "../aiSecrets.js";
+import { callGemini, callOpenAI } from "../aiProviders.js";
 import {
   DEFAULT_BILLING_CONFIG,
   normaliseConfig,
@@ -107,19 +109,197 @@ router.get(
     const uid = req.user.uid;
     const config = await readConfig(db);
     const entitlement = await loadEntitlement(db, uid, req.user.email);
+    const adminEmail = process.env.ADMIN_EMAIL || "deepakck.ptf@gmail.com";
+    const isAdmin = req.user.email === adminEmail && req.user.emailVerified;
     const limit = entitlement.disabled
       ? 0
+      : isAdmin
+      ? 10000
       : isPro(entitlement)
       ? config.pro?.monthlyAiAllowance ?? 0
       : config.free?.monthlyAiAllowance ?? 0;
     const month = new Date().toISOString().slice(0, 7).replace("-", "");
     const usageDoc = await db.collection("aiUsageMonthly").findOne({ _id: `${uid}_${month}` });
     const used = usageDoc?.generations || 0;
+    const activeKeysCount = await db.collection("aiKeys").countDocuments({ enabled: true });
     res.json({
       limit,
       used,
       remaining: Math.max(0, limit - used),
-      available: false,
+      available: Boolean(activeKeysCount > 0 && (limit > 0 || isAdmin)),
+    });
+  })
+);
+
+// Platform-AI generation using backend-managed keys and fallback order
+router.post(
+  "/ai/generate",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const db = await getDb();
+    const uid = req.user.uid;
+    const reqBody = req.body?.request || req.body;
+    if (!reqBody || typeof reqBody !== "object") {
+      return res.status(400).json({ error: "Invalid AI request." });
+    }
+
+    const config = await readConfig(db);
+    const entitlement = await loadEntitlement(db, uid, req.user.email);
+    const adminEmail = process.env.ADMIN_EMAIL || "deepakck.ptf@gmail.com";
+    const isAdmin = req.user.email === adminEmail && req.user.emailVerified;
+
+    if (entitlement.disabled) {
+      return res.status(403).json({ error: "This account is disabled." });
+    }
+
+    const limit = isAdmin
+      ? 10000
+      : isPro(entitlement)
+      ? config.pro?.monthlyAiAllowance ?? 0
+      : config.free?.monthlyAiAllowance ?? 0;
+
+    if (limit <= 0) {
+      return res.status(403).json({
+        error: "Built-in AI is not enabled for your plan. Add your own Gemini key in Settings.",
+      });
+    }
+
+    const monthStr = new Date().toISOString().slice(0, 7).replace("-", "");
+    const monthKey = `${uid}_${monthStr}`;
+    const usageDoc = await db.collection("aiUsageMonthly").findOne({ _id: monthKey });
+    const used = usageDoc?.generations || 0;
+
+    if (!isAdmin && used >= limit) {
+      return res.status(429).json({
+        error: `You have reached this month's ${limit} built-in AI generations. Add your own Gemini key in Settings to continue.`,
+      });
+    }
+
+    // Daily spend cap
+    const todayStr = new Date().toISOString().slice(0, 10);
+    const dayRef = await db.collection("aiUsageDaily").findOne({ _id: todayStr });
+    const aiConfigDoc = (await db.collection("aiConfig").findOne({ _id: "current" })) || {};
+    const maxDailyCost = aiConfigDoc.limits?.dailyCostLimitUsd ?? 2;
+    if (maxDailyCost > 0 && (dayRef?.costUsd || 0) >= maxDailyCost) {
+      return res.status(429).json({
+        error: "Built-in AI has reached today's limit. Try again tomorrow or use your own Gemini key.",
+      });
+    }
+
+    // Retrieve active keys in order
+    const allKeys = await db.collection("aiKeys").find({ enabled: true }).toArray();
+    const order = aiConfigDoc.order || [];
+    const orderedKeys = [
+      ...order.map((id) => allKeys.find((k) => k.id === id || k._id === id)).filter(Boolean),
+      ...allKeys.filter((k) => !order.includes(k.id || k._id)),
+    ];
+
+    if (!orderedKeys.length) {
+      return res.status(503).json({
+        error: "Built-in AI has no active provider keys configured. Please add keys in Admin > AI Providers or use your own Gemini key.",
+      });
+    }
+
+    let lastError = null;
+    for (const key of orderedKeys) {
+      const keyId = key.id || key._id;
+      if (key.cooldownUntil && key.cooldownUntil > Date.now()) continue;
+
+      const secretDoc = await db.collection("aiSecrets").findOne({ _id: keyId });
+      if (!secretDoc) continue;
+
+      let rawKey;
+      try {
+        rawKey = open(secretDoc.sealed, keyId);
+      } catch (err) {
+        lastError = err.message;
+        continue;
+      }
+
+      const provider = key.provider || "gemini";
+      const pConfig = aiConfigDoc.providers?.[provider] || {};
+      const model = pConfig.model || (provider === "gemini" ? "gemini-2.5-flash" : "gpt-4o-mini");
+      const timeoutMs = aiConfigDoc.limits?.requestTimeoutMs || 90000;
+      const maxOutputTokens = aiConfigDoc.limits?.maxOutputTokens || 32768;
+
+      try {
+        const out =
+          provider === "gemini"
+            ? await callGemini(rawKey, model, reqBody, { timeoutMs, maxOutputTokens })
+            : await callOpenAI(rawKey, model, reqBody, { timeoutMs, maxOutputTokens });
+
+        const inputCost = pConfig.inputCostPerM ?? (provider === "gemini" ? 0.1 : 0.15);
+        const outputCost = pConfig.outputCostPerM ?? (provider === "gemini" ? 0.4 : 0.6);
+        const cost = (out.inputTokens * inputCost + out.outputTokens * outputCost) / 1e6;
+
+        // Record successful generation and update metrics
+        await Promise.all([
+          db.collection("aiKeys").updateOne(
+            { _id: keyId },
+            {
+              $set: { health: "healthy", lastSuccessAt: Date.now(), lastError: null, consecutiveFailures: 0, cooldownUntil: null },
+              $inc: {
+                "usage.requests": 1,
+                "usage.inputTokens": out.inputTokens,
+                "usage.outputTokens": out.outputTokens,
+                "usage.costUsd": cost,
+              },
+            }
+          ),
+          db.collection("aiUsageMonthly").updateOne(
+            { _id: monthKey },
+            { $inc: { generations: 1 }, $set: { uid, month: monthStr, updatedAt: Date.now() } },
+            { upsert: true }
+          ),
+          db.collection("aiUsageDaily").updateOne(
+            { _id: todayStr },
+            { $inc: { requests: 1, costUsd: cost }, $set: { date: todayStr, updatedAt: Date.now() } },
+            { upsert: true }
+          ),
+          db.collection("aiUsage").insertOne({
+            uid,
+            keyId,
+            provider,
+            model,
+            success: true,
+            inputTokens: out.inputTokens,
+            outputTokens: out.outputTokens,
+            costUsd: cost,
+            at: Date.now(),
+          }),
+        ]);
+
+        return res.json({
+          text: out.text,
+          finishReason: out.finishReason || "STOP",
+          usage: { inputTokens: out.inputTokens, outputTokens: out.outputTokens },
+          provider,
+          model,
+        });
+      } catch (err) {
+        lastError = err.message;
+        const isQuotaOrRate = err.kind === "rate" || err.kind === "quota" || err.status === 429;
+        const cooldownSec = isQuotaOrRate ? 300 : 60;
+        await db.collection("aiKeys").updateOne(
+          { _id: keyId },
+          {
+            $set: {
+              health: isQuotaOrRate ? "cooling" : "failing",
+              cooldownUntil: Date.now() + cooldownSec * 1000,
+              lastFailureAt: Date.now(),
+              lastError: err.message,
+            },
+            $inc: { failureCount: 1, consecutiveFailures: 1 },
+          }
+        );
+        if (err.permanent) {
+          return res.status(400).json({ error: `Provider rejected request: ${err.message}` });
+        }
+      }
+    }
+
+    return res.status(503).json({
+      error: `Built-in AI is busy on all configured providers (${lastError || "please retry in a few moments"}). Or use your own Gemini key.`,
     });
   })
 );
@@ -169,7 +349,7 @@ router.get(
 
 // Check access to a resource / PYQ
 router.post(
-  "/resources/check",
+  ["/resources/check", "/me/resource-access"],
   requireAuth,
   asyncHandler(async (req, res) => {
     const db = await getDb();
@@ -188,7 +368,7 @@ router.post(
 
 // Unlock a resource / PYQ
 router.post(
-  "/resources/unlock",
+  ["/resources/unlock", "/me/unlock-resource"],
   requireAuth,
   asyncHandler(async (req, res) => {
     const db = await getDb();
@@ -235,7 +415,7 @@ router.post(
 
 // Reserve mock test
 router.post(
-  "/tests/reserve",
+  ["/tests/reserve", "/me/reserve-test"],
   requireAuth,
   asyncHandler(async (req, res) => {
     const db = await getDb();
@@ -306,7 +486,7 @@ router.post(
 
 // Commit mock test
 router.post(
-  "/tests/commit",
+  ["/tests/commit", "/me/commit-test"],
   requireAuth,
   asyncHandler(async (req, res) => {
     const db = await getDb();
@@ -358,7 +538,7 @@ router.post(
 
 // Release mock test reservation
 router.post(
-  "/tests/release",
+  ["/tests/release", "/me/release-test"],
   requireAuth,
   asyncHandler(async (req, res) => {
     const db = await getDb();
@@ -657,6 +837,20 @@ export async function reconcileOrders(db, { uid, maxAgeMs = 7 * 86_400_000, limi
 }
 
 // Reconcile user's own unsettled payments
+router.get(
+  "/cron/reconcile",
+  asyncHandler(async (req, res) => {
+    const secret = process.env.CRON_SECRET?.trim();
+    const auth = req.headers.authorization;
+    if (!secret || auth !== `Bearer ${secret}`) {
+      return res.status(401).json({ error: "Unauthorized." });
+    }
+    const db = await getDb();
+    const result = await reconcileOrders(db, {});
+    res.json(result);
+  })
+);
+
 router.post(
   "/payments/reconcile-mine",
   requireAuth,
