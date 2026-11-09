@@ -116,7 +116,7 @@ async function start() {
   try {
     await getDb();
     console.log("[db] Connected to MongoDB");
-    const server = app.listen(PORT, "0.0.0.0", () => {
+    const server = app.listen(PORT, "127.0.0.1", () => {
       console.log(`[server] PSC Express backend listening on http://127.0.0.1:${PORT}`);
     });
 
