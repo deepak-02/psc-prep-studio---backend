@@ -165,6 +165,4 @@ async function start() {
 export { app };
 export default app;
 
-if (process.argv[1] && process.argv[1].endsWith("index.js")) {
-  start();
-}
+start();
