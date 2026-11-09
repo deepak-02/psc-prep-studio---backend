@@ -16,7 +16,52 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-app.use(cors({ origin: true, credentials: true }));
+// Frontend origin allowlist
+const defaultAllowedOrigins = [
+  "http://localhost:8080",
+  "http://127.0.0.1:8080",
+  "http://localhost:5173",
+  "http://127.0.0.1:5173",
+  "http://localhost:3000",
+  "https://psc-prep-studio.vercel.app",
+];
+
+const envAllowed = (process.env.ALLOWED_ORIGINS || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+const allowedOriginsSet = new Set([...defaultAllowedOrigins, ...envAllowed]);
+
+function isAllowedOrigin(origin) {
+  if (!origin) return true; // Non-browser / same-origin / mobile apps / server-to-server
+  if (allowedOriginsSet.has(origin)) return true;
+  // Allow Vercel preview deployments (e.g. psc-prep-studio-git-feat-...vercel.app)
+  if (/^https:\/\/psc-prep-studio(-[a-z0-9-]+)?\.vercel\.app$/.test(origin)) return true;
+  return false;
+}
+
+app.use(
+  cors({
+    origin: (origin, callback) => {
+      if (isAllowedOrigin(origin)) {
+        callback(null, true);
+      } else {
+        // Disallow arbitrary cross-origin requests
+        callback(null, false);
+      }
+    },
+    credentials: true,
+    methods: ["GET", "HEAD", "PUT", "PATCH", "POST", "DELETE", "OPTIONS"],
+    allowedHeaders: [
+      "Content-Type",
+      "Authorization",
+      "X-Requested-With",
+      "x-razorpay-signature",
+      "x-razorpay-event-id",
+    ],
+  })
+);
 app.use(
   express.json({
     limit: "10mb",
