@@ -3,6 +3,12 @@ import dotenv from "dotenv";
 
 dotenv.config();
 
+let parsedServiceAccount = null;
+
+export function getServiceAccount() {
+  return parsedServiceAccount;
+}
+
 function initFirebase() {
   if (admin.apps.length) return;
 
@@ -31,6 +37,7 @@ function initFirebase() {
       throw new Error("Firebase service account is missing private_key.");
     }
     serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, "\n");
+    parsedServiceAccount = serviceAccount;
     admin.initializeApp({
       credential: admin.credential.cert(serviceAccount),
       projectId: serviceAccount.project_id,

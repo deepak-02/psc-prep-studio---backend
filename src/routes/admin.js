@@ -468,11 +468,14 @@ router.post(
   })
 );
 
-// Analytics fallback (matches AdminPage.tsx Ga type)
+// Analytics report from Google Analytics Data API
 router.get(
   "/analytics",
   asyncHandler(async (req, res) => {
-    res.json({ configured: false });
+    const days = Math.max(1, Math.min(365, Number(req.query.days) || 28));
+    const { gaReport } = await import("../analytics.js");
+    const report = await gaReport(days);
+    res.json(report);
   })
 );
 
