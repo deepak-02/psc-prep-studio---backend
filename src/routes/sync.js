@@ -18,15 +18,18 @@ router.post(
 
     const saveBatch = async (colName, items) => {
       if (!Array.isArray(items) || !items.length) return;
+      const MAX_BATCH = 200;
       const ops = items
+        .slice(0, MAX_BATCH)
         .filter((item) => item && typeof item.id === "string")
         .map((item) => {
           const { id, ...rest } = item;
-          const storageId = `${uid}:${id}`;
+          const cleanId = String(id).replace(/[^a-zA-Z0-9_\-:.]/g, "");
+          const storageId = `${uid}:${cleanId}`;
           return {
             updateOne: {
               filter: { _id: storageId },
-              update: { $set: { ...rest, id, ownerId: uid, _id: storageId } },
+              update: { $set: { ...rest, id: cleanId, ownerId: uid, _id: storageId } },
               upsert: true,
             },
           };

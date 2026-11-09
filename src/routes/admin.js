@@ -644,12 +644,13 @@ router.get(
     if (status === "sent") filter.ok = true;
     if (status === "failed") filter.ok = false;
     if (q) {
+      const safeQ = String(q).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
       filter.$or = [
-        { to: { $regex: q, $options: "i" } },
-        { subject: { $regex: q, $options: "i" } },
-        { template: { $regex: q, $options: "i" } },
-        { ref: { $regex: q, $options: "i" } },
-        { error: { $regex: q, $options: "i" } },
+        { to: { $regex: safeQ, $options: "i" } },
+        { subject: { $regex: safeQ, $options: "i" } },
+        { template: { $regex: safeQ, $options: "i" } },
+        { ref: { $regex: safeQ, $options: "i" } },
+        { error: { $regex: safeQ, $options: "i" } },
       ];
     }
 

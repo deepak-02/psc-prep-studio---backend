@@ -10,6 +10,7 @@ import supportRoutes from "./routes/support.js";
 import adminRoutes from "./routes/admin.js";
 import authRoutes from "./routes/auth.js";
 import pyqRoutes from "./routes/pyq.js";
+import { apiLimiter, authLimiter, syncPushLimiter, paymentLimiter, aiLimiter } from "./rateLimiter.js";
 
 dotenv.config();
 
@@ -114,6 +115,13 @@ app.get("/api/health", async (req, res) => {
     });
   }
 });
+
+// Rate limiters for security and anti-spam protection
+app.use("/api", apiLimiter);
+app.use("/api/auth", authLimiter);
+app.use("/api/sync/push", syncPushLimiter);
+app.use("/api/payments/order", paymentLimiter);
+app.use("/api/ai", aiLimiter);
 
 // Mount modular routes
 app.use("/api/sync", syncRoutes);
