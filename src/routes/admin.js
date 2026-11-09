@@ -2,6 +2,7 @@ import { Router } from "express";
 import { getDb } from "../db.js";
 import { requireAuth, requireAdmin } from "../auth.js";
 import { asyncHandler } from "../asyncHandler.js";
+import { reconcileOrders } from "./billing.js";
 import {
   DEFAULT_BILLING_CONFIG,
   normaliseConfig,
@@ -28,22 +29,64 @@ async function logAudit(db, adminEmail, action, target, detail = null) {
   });
 }
 
-// Overview stats
+// Overview stats (strictly matches AdminPage.tsx Overview interface)
 router.get(
   "/overview",
   asyncHandler(async (req, res) => {
     const db = await getDb();
-    const [totalUsers, activePro, paymentsCount, ticketsOpen] = await Promise.all([
-      db.collection("users").countDocuments(),
-      db.collection("entitlements").countDocuments({ planId: { $ne: "free" }, subscriptionExpiresAt: { $gt: Date.now() } }),
-      db.collection("payments").countDocuments({ status: "paid" }),
-      db.collection("support").countDocuments({ status: "open" }),
+    const now = Date.now();
+    const day = 86_400_000;
+
+    const [users, ents] = await Promise.all([
+      db.collection("users").find({}).toArray(),
+      db.collection("entitlements").find({}).toArray(),
     ]);
 
+    const total = users.length;
+    let verified = 0;
+    let active7 = 0;
+    const signups = {};
+
+    for (let i = 0; i < 30; i++) {
+      const d = new Date(now - (29 - i) * day).toISOString().slice(0, 10);
+      signups[d] = 0;
+    }
+
+    for (const u of users) {
+      if (u.emailVerified) verified++;
+      const created = u.createdAt ? new Date(u.createdAt).getTime() : 0;
+      const last = u.lastSeen ? new Date(u.lastSeen).getTime() : 0;
+      if (created && now - created < 30 * day) {
+        const k = new Date(created).toISOString().slice(0, 10);
+        signups[k] = (signups[k] ?? 0) + 1;
+      }
+      if (last && now - last < 7 * day) {
+        active7++;
+      }
+    }
+
+    let pro = 0;
+    let annual = 0;
+    let expired = 0;
+    let video = 0;
+
+    for (const eDoc of ents) {
+      const e = normaliseEntitlement(eDoc._id, eDoc);
+      if (isPro(e, now)) {
+        pro++;
+        if (e.planId === "pro_annual") annual++;
+      } else if (
+        e.planStatus === "expired" ||
+        (e.planId !== "free" && (e.subscriptionExpiresAt ?? 0) <= now)
+      ) {
+        expired++;
+      }
+      if (e.videoStudio) video++;
+    }
+
     res.json({
-      users: { total: totalUsers, activePro },
-      payments: { paidCount: paymentsCount },
-      support: { openCount: ticketsOpen },
+      users: { total, verified, active7, signups },
+      plans: { pro, annual, expired, video },
     });
   })
 );
@@ -56,48 +99,84 @@ router.get(
     const page = Math.max(1, Number(req.query.page) || 1);
     const pageSize = Math.max(5, Math.min(100, Number(req.query.pageSize) || 20));
     const query = (req.query.q ?? "").trim().toLowerCase();
-
-    const filter = {};
-    if (query) {
-      filter.$or = [
-        { email: { $regex: query, $options: "i" } },
-        { name: { $regex: query, $options: "i" } },
-        { _id: query },
-      ];
-    }
+    const plan = req.query.plan ?? "";
+    const sort = req.query.sort ?? "newest";
 
     const configDoc = await db.collection("billingConfig").findOne({ _id: "current" });
     const config = configDoc ? normaliseConfig(configDoc) : DEFAULT_BILLING_CONFIG;
 
-    const [users, total] = await Promise.all([
-      db.collection("users").find(filter).skip((page - 1) * pageSize).limit(pageSize).toArray(),
-      db.collection("users").countDocuments(filter),
+    const [allUsers, allEnts] = await Promise.all([
+      db.collection("users").find({}).toArray(),
+      db.collection("entitlements").find({}).toArray(),
     ]);
 
-    const uids = users.map((u) => u._id);
-    const entitlements = await db.collection("entitlements").find({ _id: { $in: uids } }).toArray();
-    const entMap = new Map(entitlements.map((e) => [e._id, e]));
+    const entMap = new Map(allEnts.map((e) => [e._id, e]));
 
-    const items = users.map((u) => {
+    let rows = allUsers.map((u) => {
       const raw = entMap.get(u._id);
       const e = raw ? normaliseEntitlement(u._id, raw) : emptyEntitlement(u._id, u.email);
+      const pro = isPro(e);
+      const providers = Array.isArray(u.providers) && u.providers.length > 0 ? u.providers : ["password"];
+      const createdAt = u.createdAt ? (typeof u.createdAt === "number" ? u.createdAt : Date.parse(u.createdAt) || null) : null;
+      const lastSignIn = u.lastSeen ? (typeof u.lastSeen === "number" ? u.lastSeen : Date.parse(u.lastSeen) || null) : null;
       return {
         uid: u._id,
         email: u.email ?? null,
         name: u.name ?? null,
-        lastSignIn: u.lastSeen ?? null,
+        disabled: Boolean(u.disabled || e.disabled),
+        verified: Boolean(u.emailVerified ?? u.verified ?? false),
+        providers,
+        createdAt,
+        lastSignIn,
         entitlement: e,
-        pro: isPro(e),
+        pro,
         quotas: remainingQuotas(config, e),
       };
     });
 
+    const counts = {
+      all: rows.length,
+      pro: rows.filter((r) => r.pro).length,
+      free: rows.filter((r) => !r.pro).length,
+      video: rows.filter((r) => r.entitlement?.videoStudio).length,
+      disabled: rows.filter((r) => r.disabled).length,
+    };
+
+    if (query) {
+      rows = rows.filter(
+        (u) =>
+          (u.email ?? "").toLowerCase().includes(query) ||
+          (u.name ?? "").toLowerCase().includes(query) ||
+          u.uid.toLowerCase() === query
+      );
+    }
+
+    if (plan === "pro") rows = rows.filter((r) => r.pro);
+    else if (plan === "free") rows = rows.filter((r) => !r.pro);
+    else if (plan === "video") rows = rows.filter((r) => r.entitlement?.videoStudio);
+    else if (plan === "disabled") rows = rows.filter((r) => r.disabled);
+    else if (plan === "unverified") rows = rows.filter((r) => !r.verified);
+
+    rows.sort(
+      sort === "active"
+        ? (x, y) => (y.lastSignIn ?? 0) - (x.lastSignIn ?? 0)
+        : sort === "name"
+        ? (x, y) => (x.name || x.email || "").localeCompare(y.name || y.email || "")
+        : sort === "oldest"
+        ? (x, y) => (x.createdAt ?? 0) - (y.createdAt ?? 0)
+        : (x, y) => (y.createdAt ?? 0) - (x.createdAt ?? 0)
+    );
+
+    const total = rows.length;
+    const paginated = rows.slice((page - 1) * pageSize, page * pageSize);
+
     res.json({
-      users: items,
+      users: paginated,
       page,
       pageSize,
       total,
       pages: Math.ceil(total / pageSize) || 1,
+      counts,
     });
   })
 );
@@ -158,21 +237,55 @@ router.post(
   })
 );
 
-// Admin payments list
+// Admin payments list with revenue summary
 router.get(
   "/payments",
   asyncHandler(async (req, res) => {
     const db = await getDb();
     const page = Math.max(1, Number(req.query.page) || 1);
     const pageSize = Math.max(5, Math.min(100, Number(req.query.pageSize) || 25));
+    const from = Number(req.query.from) || 0;
+    const to = Number(req.query.to) || Date.now() + 86_400_000;
 
-    const [payments, total] = await Promise.all([
-      db.collection("payments").find({}).sort({ createdAt: -1 }).skip((page - 1) * pageSize).limit(pageSize).toArray(),
-      db.collection("payments").countDocuments({}),
+    const filter = {};
+    if (from || to) {
+      filter.createdAt = { $gte: from, $lt: to };
+    }
+
+    const [rows, total, allMatching] = await Promise.all([
+      db
+        .collection("payments")
+        .find(filter)
+        .sort({ createdAt: -1 })
+        .skip((page - 1) * pageSize)
+        .limit(pageSize)
+        .toArray(),
+      db.collection("payments").countDocuments(filter),
+      db.collection("payments").find(filter).toArray(),
     ]);
 
-    const items = payments.map(({ _id, ...rest }) => rest);
+    const paid = allMatching.filter((r) => r.status === "paid" || r.status === "partially_refunded");
+    const sum = (list) => list.reduce((n, r) => n + (r.amount || 0) - (r.refundedAmount || 0), 0);
+    const monthStart = new Date();
+    monthStart.setUTCDate(1);
+    monthStart.setUTCHours(0, 0, 0, 0);
+
+    const summary = {
+      revenue: sum(paid),
+      thisMonth: sum(paid.filter((r) => (r.paidAt || 0) >= monthStart.getTime())),
+      annual: sum(paid.filter((r) => r.product === "pro_annual")),
+      monthly: sum(paid.filter((r) => r.product === "pro_monthly")),
+      payg: sum(paid.filter((r) => r.product && !r.product.startsWith("pro_"))),
+      newSubscriptions: paid.filter((r) => r.product && r.product.startsWith("pro_")).length,
+      failed: allMatching.filter((r) => r.status === "failed" || (r.failures?.length || 0) > 0).length,
+      refunds: allMatching.reduce((n, r) => n + (r.refundedAmount || 0), 0),
+      refundCount: allMatching.filter((r) => (r.refunds?.length || 0) > 0).length,
+      count: allMatching.length,
+    };
+
+    const items = rows.map(({ _id, ...rest }) => ({ id: _id, ...rest }));
     res.json({
+      summary,
       payments: items,
       page,
       pageSize,
@@ -182,13 +295,33 @@ router.get(
   })
 );
 
+router.post(
+  "/payments/reconcile",
+  asyncHandler(async (req, res) => {
+    const db = await getDb();
+    const result = await reconcileOrders(db, { maxAgeMs: 7 * 86_400_000 });
+    await logAudit(db, req.user.email, "reconcile", "payments", result.summary);
+    res.json(result);
+  })
+);
+
 // Get & Update billing config
 router.get(
   "/billing-config",
   asyncHandler(async (req, res) => {
     const db = await getDb();
-    const doc = await db.collection("billingConfig").findOne({ _id: "current" });
-    res.json({ config: doc ? normaliseConfig(doc) : DEFAULT_BILLING_CONFIG });
+    const [doc, history] = await Promise.all([
+      db.collection("billingConfig").findOne({ _id: "current" }),
+      db.collection("billingConfigHistory").find({}).sort({ version: -1 }).limit(10).toArray(),
+    ]);
+    res.json({
+      config: doc ? normaliseConfig(doc) : DEFAULT_BILLING_CONFIG,
+      history: history.map((h) => ({
+        version: h.version,
+        updatedAt: h.updatedAt,
+        updatedBy: h.updatedBy ?? null,
+      })),
+    });
   })
 );
 
@@ -217,7 +350,13 @@ router.get(
     const pageSize = Math.max(5, Math.min(100, Number(req.query.pageSize) || 25));
 
     const [logs, total] = await Promise.all([
-      db.collection("adminAuditLogs").find({}).sort({ at: -1 }).skip((page - 1) * pageSize).limit(pageSize).toArray(),
+      db
+        .collection("adminAuditLogs")
+        .find({})
+        .sort({ at: -1 })
+        .skip((page - 1) * pageSize)
+        .limit(pageSize)
+        .toArray(),
       db.collection("adminAuditLogs").countDocuments({}),
     ]);
 
@@ -247,6 +386,36 @@ router.get(
       page: 1,
       pageSize: 100,
     });
+  })
+);
+
+// AI tab fallback for local dev
+router.get(
+  "/ai",
+  asyncHandler(async (req, res) => {
+    res.json({
+      config: {
+        version: 1,
+        order: [],
+        providers: {
+          gemini: { enabled: true, model: "gemini-2.5-flash", inputCostPerM: 0.1, outputCostPerM: 0.4 },
+          openai: { enabled: true, model: "gpt-4o-mini", inputCostPerM: 0.15, outputCostPerM: 0.6 },
+        },
+        limits: { dailyCostLimitUsd: 2 },
+      },
+      keys: [],
+      usage: [],
+      secretsConfigured: false,
+      maxKeysPerProvider: 5,
+    });
+  })
+);
+
+// Analytics fallback (matches AdminPage.tsx Ga type)
+router.get(
+  "/analytics",
+  asyncHandler(async (req, res) => {
+    res.json({ configured: false });
   })
 );
 

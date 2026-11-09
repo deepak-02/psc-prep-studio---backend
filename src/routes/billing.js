@@ -52,7 +52,7 @@ router.get(
   asyncHandler(async (req, res) => {
     const db = await getDb();
     const config = await readConfig(db);
-    const keyId = process.env.RAZORPAY_KEY_ID ?? null;
+    const keyId = process.env.RAZORPAY_KEY_ID?.trim() ?? null;
     res.json({ enabled: Boolean(keyId), keyId, config });
   })
 );
@@ -67,10 +67,21 @@ router.get(
     const config = await readConfig(db);
     const entitlement = await loadEntitlement(db, uid, req.user.email);
 
-    // Only update user's lastSeen & email on GET /me to prevent overwriting concurrent updates
+    // Update user's lastSeen, profile & provider info on GET /me
     await db.collection("users").updateOne(
       { _id: uid },
-      { $set: { email: req.user.email, name: req.user.name, lastSeen: Date.now() } },
+      {
+        $set: {
+          email: req.user.email,
+          name: req.user.name,
+          emailVerified: req.user.emailVerified,
+          providers: req.user.providers,
+          lastSeen: Date.now(),
+        },
+        $setOnInsert: {
+          createdAt: Date.now(),
+        },
+      },
       { upsert: true }
     );
 
@@ -87,6 +98,32 @@ router.get(
 );
 
 // User payment history and owned items
+// Monthly platform-AI allowance for this user
+router.get(
+  "/ai/allowance",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const db = await getDb();
+    const uid = req.user.uid;
+    const config = await readConfig(db);
+    const entitlement = await loadEntitlement(db, uid, req.user.email);
+    const limit = entitlement.disabled
+      ? 0
+      : isPro(entitlement)
+      ? config.pro?.monthlyAiAllowance ?? 0
+      : config.free?.monthlyAiAllowance ?? 0;
+    const month = new Date().toISOString().slice(0, 7).replace("-", "");
+    const usageDoc = await db.collection("aiUsageMonthly").findOne({ _id: `${uid}_${month}` });
+    const used = usageDoc?.generations || 0;
+    res.json({
+      limit,
+      used,
+      remaining: Math.max(0, limit - used),
+      available: false,
+    });
+  })
+);
+
 router.get(
   "/me/payments",
   requireAuth,
@@ -357,8 +394,8 @@ router.post(
     const p = config.products[product];
     if (!p || !p.active) return res.status(400).json({ error: "Unavailable product." });
 
-    const keyId = process.env.RAZORPAY_KEY_ID;
-    const keySecret = process.env.RAZORPAY_KEY_SECRET;
+    const keyId = process.env.RAZORPAY_KEY_ID?.trim();
+    const keySecret = process.env.RAZORPAY_KEY_SECRET?.trim();
     if (!keyId || !keySecret) return res.status(503).json({ error: "Payments are not configured." });
 
     // Validate and cap items for resource_bundle
@@ -455,7 +492,7 @@ router.post(
     const uid = req.user.uid;
     const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body || {};
 
-    const keySecret = process.env.RAZORPAY_KEY_SECRET;
+    const keySecret = process.env.RAZORPAY_KEY_SECRET?.trim();
     if (!keySecret) return res.status(503).json({ error: "Payments not configured." });
 
     // Signature check
@@ -515,6 +552,158 @@ router.post(
       entitlement,
       quotas: remainingQuotas(config, entitlement),
     });
+  })
+);
+
+export async function settleOrder(db, order, paymentId, settledVia = "verify", email = null) {
+  const claim = await db.collection("payments").updateOne(
+    { orderId: order.orderId, uid: order.uid, entitlementGranted: false },
+    {
+      $set: {
+        status: "paid",
+        entitlementGranted: true,
+        paymentId,
+        paidAt: Date.now(),
+        settledVia,
+      },
+    }
+  );
+
+  const config = await readConfig(db);
+  const entitlement = await loadEntitlement(db, order.uid, email);
+
+  if (claim.modifiedCount === 1) {
+    const next = grantProduct(config, entitlement, order.product, Date.now(), "payment", null);
+
+    if (order.product === "resource_bundle" && Array.isArray(order.items)) {
+      const ops = order.items.filter(validItemKey).map((k) => ({
+        updateOne: {
+          filter: { _id: `${order.uid}_${docId(k)}` },
+          update: { $set: { uid: order.uid, key: k, source: "payment", at: Date.now() } },
+          upsert: true,
+        },
+      }));
+      if (ops.length) await db.collection("purchases").bulkWrite(ops);
+    }
+
+    await saveEntitlement(db, next, email);
+    return { settled: true, entitlement: next, quotas: remainingQuotas(config, next) };
+  }
+
+  return { settled: false, entitlement, quotas: remainingQuotas(config, entitlement) };
+}
+
+export async function reconcileOrders(db, { uid, maxAgeMs = 7 * 86_400_000, limit = 50 } = {}) {
+  const now = Date.now();
+  const since = now - maxAgeMs;
+  const query = {
+    createdAt: { $gte: since },
+    status: { $nin: ["refunded", "expired"] },
+    entitlementGranted: { $ne: true },
+  };
+  if (uid) query.uid = uid;
+
+  const orders = await db.collection("payments").find(query).sort({ createdAt: -1 }).limit(limit).toArray();
+  const summary = { checked: orders.length, granted: 0, pending: 0, expired: 0, error: 0 };
+
+  const keyId = process.env.RAZORPAY_KEY_ID?.trim();
+  const keySecret = process.env.RAZORPAY_KEY_SECRET?.trim();
+
+  for (const o of orders) {
+    try {
+      if (!keyId || !keySecret) {
+        summary.pending++;
+        continue;
+      }
+
+      // Check with Razorpay REST API
+      const auth = Buffer.from(`${keyId}:${keySecret}`).toString("base64");
+      const rzpRes = await fetch(`https://api.razorpay.com/v1/orders/${encodeURIComponent(o.orderId)}/payments`, {
+        headers: { Authorization: `Basic ${auth}` },
+        signal: AbortSignal.timeout(8000),
+      });
+
+      if (!rzpRes.ok) {
+        summary.error++;
+        continue;
+      }
+
+      const data = await rzpRes.json();
+      const items = Array.isArray(data.items) ? data.items : [];
+      const live = items.find((p) => p.status === "captured" || p.status === "authorized");
+
+      if (live) {
+        const res = await settleOrder(db, o, live.id, "reconcile", o.email);
+        if (res.settled) {
+          summary.granted++;
+        } else {
+          summary.pending++;
+        }
+      } else {
+        // Expire if older than 24 hours
+        if (now - o.createdAt > 24 * 3_600_000 && o.status === "created") {
+          await db.collection("payments").updateOne({ orderId: o.orderId }, { $set: { status: "expired", expiredAt: now } });
+          summary.expired++;
+        } else {
+          summary.pending++;
+        }
+      }
+    } catch {
+      summary.error++;
+    }
+  }
+
+  return { checked: orders.length, summary };
+}
+
+// Reconcile user's own unsettled payments
+router.post(
+  "/payments/reconcile-mine",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const db = await getDb();
+    const uid = req.user.uid;
+    const result = await reconcileOrders(db, { uid, maxAgeMs: 3 * 86_400_000 });
+    res.json(result);
+  })
+);
+
+// Razorpay webhook
+router.post(
+  "/payments/webhook",
+  asyncHandler(async (req, res) => {
+    const signature = req.headers["x-razorpay-signature"] ?? "";
+    const eventId = req.headers["x-razorpay-event-id"] || null;
+    const webhookSecret = process.env.RAZORPAY_WEBHOOK_SECRET?.trim();
+    if (!webhookSecret) return res.status(503).json({ error: "Webhook secret not configured." });
+
+    const rawBody = typeof req.rawBody === "string" ? req.rawBody : JSON.stringify(req.body);
+    const expected = crypto.createHmac("sha256", webhookSecret).update(rawBody).digest("hex");
+    if (expected !== signature) {
+      return res.status(400).json({ error: "Bad signature." });
+    }
+
+    const event = req.body || {};
+    const db = await getDb();
+    const evId = eventId || docId(rawBody);
+
+    const first = await db.collection("webhookEvents").updateOne(
+      { _id: evId },
+      { $setOnInsert: { event: event.event ?? null, receivedAt: Date.now(), processed: false } },
+      { upsert: true }
+    );
+    if (!first.upsertedCount) return res.json({ ok: true, duplicate: true });
+
+    const p = event.payload?.payment?.entity;
+    if ((event.event === "payment.captured" || event.event === "order.paid") && p?.order_id && p.status === "captured") {
+      const order = await db.collection("payments").findOne({ orderId: p.order_id });
+      if (order && !order.entitlementGranted) {
+        await settleOrder(db, order, p.id, "webhook", order.email);
+      }
+    }
+
+    await db.collection("webhookEvents").updateOne({ _id: evId }, { $set: { processed: true, processedAt: Date.now() } });
+    res.json({ ok: true });
   })
 );
 

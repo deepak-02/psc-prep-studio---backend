@@ -52,11 +52,18 @@ export async function requireAuth(req, res, next) {
 
   try {
     const decoded = await admin.auth().verifyIdToken(token, true);
+    const providers = decoded.firebase?.identities
+      ? Object.keys(decoded.firebase.identities)
+      : decoded.firebase?.sign_in_provider
+      ? [decoded.firebase.sign_in_provider]
+      : ["password"];
+
     req.user = {
       uid: decoded.uid,
       email: decoded.email ?? null,
       emailVerified: decoded.email_verified === true,
       name: decoded.name ?? null,
+      providers,
     };
     next();
   } catch (err) {
@@ -83,11 +90,18 @@ export async function maybeAuth(req, res, next) {
 
   try {
     const decoded = await admin.auth().verifyIdToken(token);
+    const providers = decoded.firebase?.identities
+      ? Object.keys(decoded.firebase.identities)
+      : decoded.firebase?.sign_in_provider
+      ? [decoded.firebase.sign_in_provider]
+      : ["password"];
+
     req.user = {
       uid: decoded.uid,
       email: decoded.email ?? null,
       emailVerified: decoded.email_verified === true,
       name: decoded.name ?? null,
+      providers,
     };
   } catch {
     // Ignore invalid token for optional auth

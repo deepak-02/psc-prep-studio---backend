@@ -13,7 +13,7 @@ router.get(
     const db = await getDb();
     const uid = req.user.uid;
     const userDoc = await db.collection("users").findOne({ _id: uid });
-    res.json(userDoc?.preferences ?? null);
+    res.json({ preferences: userDoc?.preferences ?? null });
   })
 );
 
@@ -24,7 +24,7 @@ router.put(
   asyncHandler(async (req, res) => {
     const db = await getDb();
     const uid = req.user.uid;
-    const preferences = req.body || {};
+    const preferences = req.body?.preferences ?? req.body ?? {};
 
     await db.collection("users").updateOne(
       { _id: uid },
@@ -49,7 +49,7 @@ router.get(
     const db = await getDb();
     const uid = req.user.uid;
     const userDoc = await db.collection("users").findOne({ _id: uid });
-    res.json(userDoc?.geminiKey ?? null);
+    res.json({ key: userDoc?.geminiKey ?? null });
   })
 );
 
@@ -60,18 +60,20 @@ router.put(
   asyncHandler(async (req, res) => {
     const db = await getDb();
     const uid = req.user.uid;
-    const keyRecord = req.body;
+    const keyRecord = req.body?.key ?? req.body;
 
-    if (!keyRecord || keyRecord.ownerId !== uid) {
+    if (!keyRecord || (keyRecord.ownerId && keyRecord.ownerId !== uid)) {
       return res.status(400).json({ error: "Invalid vault key record." });
     }
 
+    const docToSave = { ...keyRecord, ownerId: uid };
+
     await db.collection("users").updateOne(
       { _id: uid },
-      { $set: { geminiKey: keyRecord, updatedAt: Date.now() } },
+      { $set: { geminiKey: docToSave, updatedAt: Date.now() } },
       { upsert: true }
     );
-    res.json(keyRecord);
+    res.json({ ok: true, key: docToSave });
   })
 );
 
@@ -98,28 +100,20 @@ router.delete(
   asyncHandler(async (req, res) => {
     const db = await getDb();
     const uid = req.user.uid;
-    const isAdmin = req.user.email === process.env.ADMIN_EMAIL && req.user.emailVerified;
-    const global = req.query.global === "true" && isAdmin;
 
-    let userDeleted = 0;
-    const [qDel, aDel, rDel] = await Promise.all([
-      db.collection("questions").deleteMany(isAdmin && global ? {} : { ownerId: uid }),
-      db.collection("attempts").deleteMany(isAdmin && global ? {} : { ownerId: uid }),
-      db.collection("resources").deleteMany(isAdmin && global ? {} : { ownerId: uid }),
+    // Delete user questions, attempts, user entry, and purchases
+    const [qRes, aRes, uRes, pRes] = await Promise.all([
+      db.collection("questions").deleteMany({ ownerId: uid }),
+      db.collection("attempts").deleteMany({ ownerId: uid }),
+      db.collection("users").deleteOne({ _id: uid }),
+      db.collection("purchases").deleteMany({ uid }),
     ]);
 
-    userDeleted = (qDel.deletedCount || 0) + (aDel.deletedCount || 0) + (rDel.deletedCount || 0);
-
-    let globalDeleted = 0;
-    if (global) {
-      const [sqDel, spyqDel] = await Promise.all([
-        db.collection("sharedQuestions").deleteMany({}),
-        db.collection("sharedPyq").deleteMany({}),
-      ]);
-      globalDeleted = (sqDel.deletedCount || 0) + (spyqDel.deletedCount || 0);
-    }
-
-    res.json({ userDeleted, globalDeleted });
+    res.json({
+      ok: true,
+      userDeleted: (qRes.deletedCount || 0) + (aRes.deletedCount || 0) + (uRes.deletedCount || 0),
+      globalDeleted: 0,
+    });
   })
 );
 

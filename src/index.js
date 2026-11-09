@@ -8,6 +8,8 @@ import sharedRoutes from "./routes/shared.js";
 import billingRoutes from "./routes/billing.js";
 import supportRoutes from "./routes/support.js";
 import adminRoutes from "./routes/admin.js";
+import authRoutes from "./routes/auth.js";
+import pyqRoutes from "./routes/pyq.js";
 
 dotenv.config();
 
@@ -15,7 +17,14 @@ const app = express();
 const PORT = process.env.PORT || 5000;
 
 app.use(cors({ origin: true, credentials: true }));
-app.use(express.json({ limit: "10mb" }));
+app.use(
+  express.json({
+    limit: "10mb",
+    verify: (req, _res, buf) => {
+      req.rawBody = buf.toString();
+    },
+  })
+);
 
 // Health check
 app.get("/api/health", async (req, res) => {
@@ -42,7 +51,10 @@ app.use("/api/user", userRoutes);
 app.use("/api/shared", sharedRoutes);
 app.use("/api/support", supportRoutes);
 app.use("/api/admin", adminRoutes);
-app.use("/api", billingRoutes);
+app.use("/api/auth", authRoutes);
+app.use("/api/pyq", pyqRoutes);
+app.use("/api", syncRoutes); // mounts /api/attempts, etc.
+app.use("/api", billingRoutes); // mounts /api/me, /api/billing/config, /api/ai/allowance, etc.
 
 // Global 404
 app.use((req, res) => {
@@ -59,8 +71,8 @@ async function start() {
   try {
     await getDb();
     console.log("[db] Connected to MongoDB");
-    const server = app.listen(PORT, () => {
-      console.log(`[server] PSC Express backend listening on http://localhost:${PORT}`);
+    const server = app.listen(PORT, "0.0.0.0", () => {
+      console.log(`[server] PSC Express backend listening on http://127.0.0.1:${PORT}`);
     });
 
     const shutdown = async () => {
