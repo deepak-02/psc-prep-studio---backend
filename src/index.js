@@ -17,6 +17,9 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 5000;
 
+// Trust the first reverse proxy hop (Nginx) so req.ip and express-rate-limit accurately identify client IPs
+app.set("trust proxy", 1);
+
 // Frontend origin allowlist
 const defaultAllowedOrigins = [
   "http://localhost:8080",
